@@ -1,0 +1,27 @@
+# Disk and LVM tools
+lvm2
+btrfs-progs
+dosfstools
+e2fsprogs
+parted
+gdisk
+
+# Container runtime (used to pull and export the OCI image)
+podman
+skopeo
+
+# TUI and utilities
+whiptail
+curl
+jq
+ca-certificates
+
+# GRUB (both UEFI and BIOS-fallback targets)
+grub-efi-amd64
+grub-efi-amd64-bin
+grub-pc-bin
+
+# Networking
+iproute2
+iputils-ping
+openssh-client

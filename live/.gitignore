@@ -1,0 +1,16 @@
+# live-build output and cache — never commit these
+.build/
+.cache/
+binary/
+binary.log
+binary_*
+bootstrap.log
+chroot/
+chroot.log
+chroot_*
+local/
+*.iso
+*.img
+
+# Installer scripts copied into the chroot by CI — single source of truth is the repo root
+config/includes.chroot/opt/

@@ -5,10 +5,11 @@ A minimal shell script installer for [simple-cluster](https://github.com/Tichael
 ## What it does
 
 1. Guides you through disk selection, hostname, admin user, SSH key, and network setup via a TUI
-2. Partitions the target disk for ABRoot's A/B atomic update layout
+2. Partitions the target disk and sets up LVM with thin provisioning for ABRoot's A/B layout
 3. Pulls and deploys `ghcr.io/tichael/simple-cluster:main` from GHCR
-4. Installs GRUB for UEFI boot
-5. Writes `/etc/fstab`, hostname, user, SSH key, and systemd-networkd configuration
+4. Stages the kernel and initramfs to the init LV (read directly by GRUB via LVM)
+5. Installs GRUB for UEFI boot with the ABRoot chainload configuration
+6. Writes `/etc/fstab`, hostname, user, SSH key, and systemd-networkd configuration
 
 LINSTOR/DRBD storage is configured separately after first boot. Data disks are not touched.
 
@@ -17,7 +18,7 @@ LINSTOR/DRBD storage is configured separately after first boot. Data disks are n
 Boot from a **Debian or Ubuntu live USB** (any recent version), then install dependencies:
 
 ```bash
-apt-get install -y whiptail gdisk dosfstools e2fsprogs podman grub-efi-amd64
+apt-get install -y whiptail gdisk dosfstools e2fsprogs btrfs-progs lvm2 podman grub-efi-amd64
 ```
 
 An internet connection is required to pull the image from GHCR.
@@ -30,38 +31,58 @@ cd simple-cluster-installer
 sudo ./install.sh
 ```
 
-To override the image tag or partition sizes:
+To override the image ref or root LVM size:
 
 ```bash
 sudo IMAGE_REF="ghcr.io/tichael/simple-cluster:v1.2.3" \
-     VAR_SIZE_GIB=64 \
+     ROOT_LVM_SIZE_GIB=60 \
      ./install.sh
 ```
 
 ## Disk layout
 
-| GPT label  | Default size | Filesystem | Mount point | Purpose                              |
-|------------|-------------|------------|-------------|--------------------------------------|
-| `vos-efi`  | 512 MiB     | FAT32      | `/boot/efi` | EFI System Partition                 |
-| `vos-boot` | 1 GiB       | ext4       | `/boot`     | Bootloader & kernels                 |
-| `vos-var`  | 32 GiB      | ext4       | `/var`      | Persistent state (ABRoot + Docker)   |
-| `vos-a`    | ~half       | ext4       | `/`         | Root A — active on first boot        |
-| `vos-b`    | ~half       | ext4       | —           | Root B — inactive, used for updates  |
+The installer creates 4 GPT partitions and two LVM Volume Groups:
 
-The GPT labels must match what is configured in `/usr/share/abroot/abroot.json` inside the image. Do not rename them.
+| Device / Label     | Default size      | Filesystem | Mount point  | Purpose                               |
+|--------------------|-------------------|------------|--------------|---------------------------------------|
+| Part 1 `vos-boot`  | 1 GiB             | ext4       | `/boot`      | GRUB bootloader                       |
+| Part 2 `vos-efi`   | 512 MiB           | FAT32      | `/boot/efi`  | EFI System Partition                  |
+| Part 3             | `ROOT_LVM_SIZE_GIB` | LVM PV   | —            | VG `vos-root` (see below)             |
+| Part 4             | remaining         | LVM PV     | —            | VG `vos-var` (see below)              |
+
+**VG `vos-root`** (on partition 3):
+
+| LV / Label        | Size       | Filesystem | Purpose                                     |
+|-------------------|------------|------------|---------------------------------------------|
+| `init` / `vos-init` | 1 GiB    | ext4       | Kernel + initramfs; GRUB reads via LVM      |
+| thin-pool `root-tpool` | rest  | —          | LVM thin pool for root A and B              |
+| `root-a` / `vos-a` | `ROOT_LVM_SIZE_GIB − 3` GiB (virtual) | btrfs | Root A — active on first boot |
+| `root-b` / `vos-b` | same (virtual) | btrfs | Root B — inactive; used by ABRoot for updates |
+
+**VG `vos-var`** (on partition 4):
+
+| LV / Label       | Size  | Filesystem | Mount point | Purpose                         |
+|------------------|-------|------------|-------------|---------------------------------|
+| `var` / `vos-var` | 100% | btrfs      | `/var`      | Persistent state (Docker, DRBD) |
+
+All LV labels must match the values in `/usr/share/abroot/abroot.json` inside the image. Do not rename them.
 
 ### Minimum disk size
 
-`EFI + boot + var + 20 GiB` (2 × 10 GiB minimum per root). The default layout requires at least **~74 GiB**.
+`2 GiB (boot+efi) + ROOT_LVM_SIZE_GIB + 8 GiB (min var)`. With the default `ROOT_LVM_SIZE_GIB=40`, the minimum is **~50 GiB**; 100 GiB+ is recommended for production.
 
 ## Environment variables
 
-| Variable         | Default                                  | Description                        |
-|------------------|------------------------------------------|------------------------------------|
-| `IMAGE_REF`      | `ghcr.io/tichael/simple-cluster:main`    | OCI image to deploy                |
-| `EFI_SIZE_MIB`   | `512`                                    | EFI partition size in MiB          |
-| `BOOT_SIZE_GIB`  | `1`                                      | Boot partition size in GiB         |
-| `VAR_SIZE_GIB`   | `32`                                     | /var partition size in GiB         |
+| Variable            | Default                               | Description                                    |
+|---------------------|---------------------------------------|------------------------------------------------|
+| `IMAGE_REF`         | `ghcr.io/tichael/simple-cluster:main` | OCI image to deploy                            |
+| `ROOT_LVM_SIZE_GIB` | `40`                                  | Size of the LVM root PV (GiB); var gets the rest |
+
+## Boot flow
+
+GRUB → reads `grub.cfg` from `vos-boot` → `configfile "/vos-a/abroot.cfg"` on the init LV (GRUB device `lvm/vos--root-init`) → `linux … root=UUID=<vos-a-uuid>` → kernel mounts vos-a as `/`.
+
+On ABRoot updates, the new root is staged in vos-b and the init LV's `/vos-b/abroot.cfg` is populated. GRUB's "Previous State (B)" entry gives a rollback path.
 
 ## Notes
 
@@ -69,4 +90,4 @@ The GPT labels must match what is configured in `/usr/share/abroot/abroot.json` 
 - **x86-64 only.**
 - Root disk mirroring (RAID 1) is not yet supported but is planned.
 - The `grub-efi-amd64` package must be present in the installed image (it is in the Vanilla OS core base).
-- After installation, ABRoot manages atomic updates by transacting between `vos-a` and `vos-b`.
+- Encryption support is planned but not yet implemented.

@@ -1,0 +1,55 @@
+name: Build Installer ISO
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install live-build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y live-build debootstrap
+
+      - name: Copy installer scripts into chroot
+        run: |
+          dest=live/config/includes.chroot/opt/simple-cluster-installer
+          mkdir -p "$dest/lib"
+          cp install.sh "$dest/install.sh"
+          cp lib/*.sh "$dest/lib/"
+          chmod +x "$dest/install.sh"
+
+      - name: Build ISO
+        working-directory: live
+        run: |
+          chmod +x auto/config
+          sudo lb config
+          sudo lb build
+
+      - name: Locate ISO
+        id: find_iso
+        run: echo "iso=$(ls live/*.iso 2>/dev/null | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simple-cluster-installer-iso
+          path: ${{ steps.find_iso.outputs.iso }}
+          if-no-files-found: error
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.find_iso.outputs.iso }}
+          generate_release_notes: true

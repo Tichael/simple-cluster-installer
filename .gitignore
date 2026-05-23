@@ -1,0 +1,4 @@
+# Temporary / generated files
+temp_vm_test/
+*.tmp
+*.bak

@@ -1,0 +1,16 @@
+#!/bin/sh
+# live-build auto/config — called automatically by `lb config`.
+# Defines the build options for the simple-cluster installer ISO.
+set -e
+
+lb config noauto \
+    --distribution bookworm \
+    --architectures amd64 \
+    --binary-images iso-hybrid \
+    --bootloaders grub-efi,grub-pc \
+    --debian-installer none \
+    --apt-recommends false \
+    --memtest none \
+    --win32-loader false \
+    --image-name "simple-cluster-installer" \
+    "${@}"

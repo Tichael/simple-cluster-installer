@@ -1,8 +1,15 @@
 #!/bin/bash
-# Deploy the OCI image to the target root filesystem and install GRUB.
+# Deploy the OCI image, stage kernels to the init LV, and install GRUB.
+#
+# ABRoot boot flow:
+#   GRUB reads grub.cfg from vos-boot (/boot/grub/grub.cfg).
+#   grub.cfg uses configfile to chain-load /vos-a/abroot.cfg from the init LV
+#   (GRUB device path: lvm/vos--root-init).
+#   abroot.cfg contains the linux/initrd directives with root=UUID=<vos-a-uuid>.
 
-# Pulls the OCI image and extracts it to the target directory.
-# Boot files are correctly staged so the boot partition contains the kernel.
+# Pulls the OCI image and extracts the rootfs to the target directory.
+# vos-boot must NOT be mounted at this point; it is mounted by disk_mount_boot
+# after deploy_init_lv so that kernel staging can read from $target/boot.
 # Usage: deploy_image <image_ref> <target_root>
 deploy_image() {
     local image_ref="$1" target="$2"
@@ -13,75 +20,141 @@ deploy_image() {
     local cid
     cid=$(podman create "$image_ref" /bin/true)
 
-    # Extract the full rootfs, preserving numeric owners and permissions.
     echo "Extracting rootfs to $target..."
     podman export "$cid" | tar -xp --numeric-owner -C "$target"
     podman rm "$cid"
 
-    # Ensure required mount-point directories exist (podman export may omit them).
-    mkdir -p "$target"/{dev,proc,sys,run,tmp}
+    # Ensure required directories exist (podman export may omit some).
+    mkdir -p "$target"/{dev,proc,sys,run,tmp,boot,var}
     chmod 1777 "$target/tmp"
 
-    # The boot partition is already mounted at $target/boot (empty).
-    # Move the kernel and initramfs from the extracted rootfs into it.
-    # (The image's /boot content was shadowed when the boot partition was mounted.)
-    _stage_boot_files "$target"
+    # ABRoot uses this file at the root of vos-a to track the deployed image.
+    local digest timestamp
+    digest=$(podman image inspect --format '{{index .RepoDigests 0}}' "$image_ref" 2>/dev/null \
+             | awk -F'@' '{print $2}')
+    [[ -z "$digest" ]] && digest="sha256:unknown"
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%S.000000000+00:00")
+    cat > "$target/abimage.abr" <<EOF
+{
+    "digest":"${digest}",
+    "timestamp":"${timestamp}",
+    "image":"${image_ref}"
+}
+EOF
 }
 
-# Copies kernel/initramfs files from the image into the mounted boot partition.
-# This is needed because disk_mount mounts the boot partition over /boot,
-# which shadows the /boot content extracted from the image.
-_stage_boot_files() {
+# Stages the kernel and initramfs from the extracted rootfs to the init LV,
+# and writes the GRUB chainload config (abroot.cfg) for vos-a.
+#
+# The init LV (vos-root/init, ext4, label "vos-init") is GRUB-readable via
+# (lvm/vos--root-init). It holds:
+#   /vos-a/vmlinuz-<version>
+#   /vos-a/initrd.img-<version>
+#   /vos-a/abroot.cfg          ← GRUB loads this via configfile
+#   /vos-b/                    ← empty; populated by ABRoot on first update
+#
+# Usage: deploy_init_lv <target_root>
+deploy_init_lv() {
     local target="$1"
-    local boot_stage
-    boot_stage=$(mktemp -d /tmp/sc-boot-stage.XXXX)
+    local init_staging
+    init_staging=$(mktemp -d /tmp/vos-init-staging.XXXX)
+    mount /dev/vos-root/init "$init_staging"
 
-    # Re-mount the boot partition in the staging area to access its contents.
-    local boot_dev
-    boot_dev=$(findfs LABEL=vos-boot 2>/dev/null || true)
-    if [[ -z "$boot_dev" ]]; then
-        echo "Warning: could not find vos-boot partition for boot staging." >&2
-        rmdir "$boot_stage"
-        return 0
+    mkdir -p "$init_staging/vos-a" "$init_staging/vos-b"
+
+    # Find the highest-versioned kernel in the extracted rootfs.
+    local vmlinuz kernel_version
+    vmlinuz=$(ls "$target/boot/vmlinuz-"* 2>/dev/null | sort -V | tail -1)
+    if [[ -z "$vmlinuz" ]]; then
+        echo "Error: no kernel found at $target/boot/vmlinuz-*" >&2
+        umount "$init_staging"
+        rmdir "$init_staging"
+        exit 1
     fi
+    kernel_version="${vmlinuz##*/vmlinuz-}"
+    echo "Staging kernel $kernel_version to init LV..."
 
-    # The boot partition is already mounted at $target/boot.
-    # We need to copy the /boot files from the image there.
-    # Since extraction happened before mounting, /boot inside the image was
-    # written to $target/boot but then overridden by the partition mount.
-    # Re-export just the /boot directory from the image and copy it.
-    local image_ref
-    image_ref=$(podman images --format "{{.Repository}}:{{.Tag}}" | head -1)
+    cp "$target/boot/vmlinuz-${kernel_version}"    "$init_staging/vos-a/"
+    cp "$target/boot/initrd.img-${kernel_version}" "$init_staging/vos-a/"
+    [[ -f "$target/boot/config-${kernel_version}" ]] \
+        && cp "$target/boot/config-${kernel_version}"     "$init_staging/vos-a/"
+    [[ -f "$target/boot/System.map-${kernel_version}" ]] \
+        && cp "$target/boot/System.map-${kernel_version}" "$init_staging/vos-a/"
 
-    cid=$(podman create "$image_ref" /bin/true)
-    podman export "$cid" | tar -xp --numeric-owner -C "$boot_stage" ./boot 2>/dev/null || \
-        podman export "$cid" | tar -xp --numeric-owner -C "$boot_stage" boot 2>/dev/null || true
-    podman rm "$cid"
+    # The root= parameter uses the UUID of the vos-a btrfs LV (not a label).
+    local vos_a_uuid
+    vos_a_uuid=$(blkid -s UUID -o value /dev/vos-root/root-a)
 
-    if [[ -d "$boot_stage/boot" ]]; then
-        cp -a "$boot_stage/boot/." "$target/boot/"
-    fi
+    # Write the GRUB chainload config for vos-a.
+    # $vt_handoff is a GRUB variable set at runtime; escape it in the heredoc.
+    cat > "$init_staging/vos-a/abroot.cfg" <<EOF
+insmod gzio
+insmod part_gpt
+insmod ext2
+linux   (lvm/vos--root-init)/vos-a/vmlinuz-${kernel_version} root=UUID=${vos_a_uuid} quiet bgrt_disable \$vt_handoff lsm=integrity
+initrd  (lvm/vos--root-init)/vos-a/initrd.img-${kernel_version}
+EOF
 
-    rm -rf "$boot_stage"
+    umount "$init_staging"
+    rmdir "$init_staging"
 }
 
-# Installs GRUB (EFI) and generates the initial GRUB configuration.
+# Installs GRUB (EFI) and writes the ABRoot-style grub.cfg.
+# Must be called after disk_mount_boot (vos-boot mounted at $target/boot).
 # Usage: deploy_bootloader <disk> <target_root>
 deploy_bootloader() {
     local disk="$1" target="$2"
 
     disk_bind_special "$target"
 
-    # grub-install writes EFI files to /boot/efi and the GRUB core to /boot/grub.
     chroot "$target" grub-install \
         --target=x86_64-efi \
         --efi-directory=/boot/efi \
         --bootloader-id=simple-cluster \
         --recheck \
         "$disk" \
-        || { echo "grub-install failed. Check that grub-efi-amd64 is installed in the image." >&2; disk_unbind_special "$target"; exit 1; }
-
-    chroot "$target" grub-mkconfig -o /boot/grub/grub.cfg
+        || {
+            echo "grub-install failed. Ensure grub-efi-amd64 is installed in the image." >&2
+            disk_unbind_special "$target"
+            exit 1
+        }
 
     disk_unbind_special "$target"
+
+    # Write the ABRoot-style grub.cfg directly.
+    # Do NOT use grub-mkconfig: it generates standard linux menuentry blocks
+    # instead of the configfile-based chainload that ABRoot requires.
+    mkdir -p "$target/boot/grub"
+    cat > "$target/boot/grub/grub.cfg" <<'GRUBCFG'
+set default=0
+set timeout=5
+
+if [ -s $prefix/grubenv ]; then
+    set have_grubenv=true
+    load_env
+fi
+
+if [ "${next_entry}" ] ; then
+    set default="${next_entry}"
+    set next_entry=
+    save_env next_entry
+    set boot_once=true
+fi
+
+insmod part_gpt
+insmod lvm
+insmod ext2
+
+# AUTO GENERATED BY ABROOT
+menuentry "Current State (A)" --class abroot-a {
+    set root=(lvm/vos--root-init)
+    configfile "/vos-a/abroot.cfg"
+}
+
+menuentry "Previous State (B)" --class abroot-b {
+    set root=(lvm/vos--root-init)
+    configfile "/vos-b/abroot.cfg"
+}
+# END - AUTO GENERATED BY ABROOT
+GRUBCFG
 }

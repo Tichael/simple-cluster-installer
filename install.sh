@@ -1,23 +1,22 @@
 #!/bin/bash
 # Simple Cluster Installer — entry point.
 #
-# Installs the simple-cluster OS onto a target disk using ABRoot's
-# A/B partition layout. Run from a Debian/Ubuntu live environment as root.
+# Installs the simple-cluster OS onto a target disk using ABRoot's LVM
+# thin-provisioning A/B layout. Run from a Debian/Ubuntu live environment
+# as root (e.g. a Debian netinst or Ubuntu live USB in rescue mode).
 #
-# Dependencies: whiptail gdisk dosfstools e2fsprogs podman grub-efi-amd64
-#   Install with: apt-get install -y whiptail gdisk dosfstools e2fsprogs \
-#                   podman grub-efi-amd64
+# Dependencies (install with apt-get before running):
+#   whiptail gdisk dosfstools e2fsprogs btrfs-progs lvm2 podman grub-efi-amd64
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE_REF="ghcr.io/tichael/simple-cluster:main"
+IMAGE_REF="${IMAGE_REF:-ghcr.io/tichael/simple-cluster:main}"
 
-# Size in GiB for each partition (override via environment variables).
-EFI_SIZE_MIB="${EFI_SIZE_MIB:-512}"
-BOOT_SIZE_GIB="${BOOT_SIZE_GIB:-1}"
-VAR_SIZE_GIB="${VAR_SIZE_GIB:-32}"
-# Root A and B each receive roughly half of the remaining space.
+# Size in GiB for the LVM physical volume that hosts the root A/B thin pool.
+# The var PV receives all remaining disk space.
+# Minimum recommended: 24 GiB (1 GiB init + ~2 GiB LVM overhead + ~21 GiB pool).
+ROOT_LVM_SIZE_GIB="${ROOT_LVM_SIZE_GIB:-40}"
 
 source "$SCRIPT_DIR/lib/ui.sh"
 source "$SCRIPT_DIR/lib/disk.sh"
@@ -33,12 +32,16 @@ check_root() {
 
 check_deps() {
     local missing=()
-    for cmd in whiptail sgdisk mkfs.vfat mkfs.ext4 podman grub-install blkid findfs chpasswd; do
+    local deps=(whiptail sgdisk mkfs.vfat mkfs.ext4 mkfs.btrfs
+                pvcreate vgcreate lvcreate lvs
+                podman grub-install blkid findfs chpasswd)
+    for cmd in "${deps[@]}"; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "Missing required tools: ${missing[*]}" >&2
-        echo "Install with: apt-get install -y whiptail gdisk dosfstools e2fsprogs podman grub-efi-amd64" >&2
+        echo "Install with: apt-get install -y whiptail gdisk dosfstools e2fsprogs" >&2
+        echo "              btrfs-progs lvm2 podman grub-efi-amd64" >&2
         exit 1
     fi
 }
@@ -62,24 +65,37 @@ main() {
 
     # --- Confirmation ---
     ui_confirm "Ready to install" \
-        "Disk:     $ROOT_DISK\nHostname: $HOSTNAME\nUser:     $USERNAME\n\nAll data on $ROOT_DISK will be destroyed.\nProceed?"
+        "Disk:       $ROOT_DISK\nRoot LVM:   ${ROOT_LVM_SIZE_GIB} GiB\nHostname:   $HOSTNAME\nUser:       $USERNAME\n\nAll data on $ROOT_DISK will be destroyed.\nProceed?"
 
-    # --- Installation ---
+    # --- Partitioning and LVM setup ---
     ui_step "Partitioning $ROOT_DISK..."
-    disk_partition "$ROOT_DISK" "$EFI_SIZE_MIB" "$BOOT_SIZE_GIB" "$VAR_SIZE_GIB"
+    disk_partition "$ROOT_DISK" "$ROOT_LVM_SIZE_GIB"
 
-    ui_step "Formatting partitions..."
+    ui_step "Setting up LVM volumes..."
+    disk_setup_lvm "$ROOT_DISK" "$ROOT_LVM_SIZE_GIB"
+
+    ui_step "Formatting filesystems..."
     disk_format "$ROOT_DISK"
 
-    ui_step "Mounting filesystems..."
-    MOUNT_ROOT=$(disk_mount "$ROOT_DISK")
+    # --- Image deployment ---
+    # Mount only vos-a + vos-var; vos-boot is mounted after kernel staging.
+    ui_step "Mounting root filesystems..."
+    MOUNT_ROOT=$(disk_mount_root "$ROOT_DISK")
 
     ui_step "Deploying OS image ($IMAGE_REF)..."
     deploy_image "$IMAGE_REF" "$MOUNT_ROOT"
 
+    # Stage kernels to init LV before mounting vos-boot over /boot.
+    ui_step "Staging kernels to init LV..."
+    deploy_init_lv "$MOUNT_ROOT"
+
+    # Mount boot partition (shadows /boot extracted from the image).
+    disk_mount_boot "$ROOT_DISK" "$MOUNT_ROOT"
+
     ui_step "Installing bootloader..."
     deploy_bootloader "$ROOT_DISK" "$MOUNT_ROOT"
 
+    # --- System configuration ---
     ui_step "Configuring system..."
     config_apply "$MOUNT_ROOT" "$HOSTNAME" "$USERNAME" "$PASSWORD" "$SSH_KEY" "$NETWORK_CONFIG"
 
