@@ -9,4 +9,5 @@ lb config noauto \
     --binary-images iso-hybrid \
     --debian-installer none \
     --apt-recommends false \
+    --bootappend-live "boot=live nomodeset" \
     "${@}"

@@ -37,20 +37,19 @@ jobs:
           lb config
           lb build
 
-      - name: Locate ISO
-        id: find_iso
-        run: echo "iso=$(ls live/*.iso 2>/dev/null | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Rename ISO
+        run: mv live/live-image-amd64.hybrid.iso "live/simple-cluster-installer-${{ github.ref_name }}-amd64.iso"
 
       - name: Upload ISO artifact
         uses: actions/upload-artifact@v4
         with:
           name: simple-cluster-installer-iso
-          path: ${{ steps.find_iso.outputs.iso }}
+          path: live/simple-cluster-installer-${{ github.ref_name }}-amd64.iso
           if-no-files-found: error
 
       - name: Create release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.find_iso.outputs.iso }}
+          files: live/simple-cluster-installer-${{ github.ref_name }}-amd64.iso
           generate_release_notes: true

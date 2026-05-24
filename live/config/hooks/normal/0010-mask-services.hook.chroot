@@ -1,0 +1,3 @@
+#!/bin/sh
+# Mask services that are noisy/broken in a live environment.
+systemctl mask podman-restart.service
